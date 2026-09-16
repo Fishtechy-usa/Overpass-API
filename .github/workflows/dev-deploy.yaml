@@ -1,4 +1,16 @@
-name: Build and deploy Overpass API
+name: Build and deploy Overpass API (dev)
+
+# Build -> push to ECR -> pull and redeploy the container on EC2.
+# Both jobs run on the self-hosted runner, which is the EC2 server itself.
+#
+# Required secrets (Settings -> Environments -> dev -> Secrets):
+#   AWS_REGION              e.g. us-east-2
+#   AWS_ACCESS_KEY_ID
+#   AWS_SECRET_ACCESS_KEY
+#   ECR_REPOSITORY          e.g. overpass-api-dev
+#   CONTAINER_NAME          e.g. overpass-api
+#   SLACK_WEBHOOK_URL
+
 on:
   push:
     branches: [ "master" ]
@@ -8,56 +20,107 @@ on:
       - ".github/workflows/deploy.yml"
   workflow_dispatch: {}
 
-env:
-  AWS_REGION: ${{ secrets.AWS_REGION }}
-  ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
-  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
-  CONTAINER_NAME: ${{ secrets.CONTAINER_NAME }}
-
 jobs:
-  build-and-deploy:
+  build-and-push-image-dev:
+    if: github.repository == 'Fishtechy-usa/Overpass-API'
     runs-on: self-hosted
-
+    timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
 
-      - name: Validate configuration
+      - name: Resolve build variables
+        id: resolve-build
         run: |
-          set -euo pipefail
-          for var in AWS_REGION ECR_REGISTRY ECR_REPOSITORY CONTAINER_NAME; do
-            if [ -z "${!var:-}" ]; then
-              echo "ERROR: secret $var is not set."
-              exit 1
-            fi
-          done
-          echo "All required secrets are present."
+          echo "AWS_REGION=${{ secrets.AWS_REGION }}" | tee -a "$GITHUB_OUTPUT" "$GITHUB_ENV"
+          echo "ECR_REPOSITORY=${{ secrets.ECR_REPOSITORY }}" | tee -a "$GITHUB_OUTPUT" "$GITHUB_ENV"
 
-      - name: Log in to Amazon ECR
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ steps.resolve-build.outputs.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          mask-password: true
+
+      - name: Build, tag, and push image to Amazon ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
         run: |
-          set -euo pipefail
-          aws ecr get-login-password --region "$AWS_REGION" \
-            | docker login --username AWS --password-stdin "$ECR_REGISTRY"
-
-      - name: Build image
-        run: |
-          set -euo pipefail
-          IMAGE_TAG="${GITHUB_SHA::12}"
-          echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
-
           docker build \
             -f docker/Dockerfile \
             -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
             -t "$ECR_REGISTRY/$ECR_REPOSITORY:latest" \
             .
-
-      - name: Push image to ECR
-        run: |
-          set -euo pipefail
           docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
           docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
 
-      - name: Deploy container
+  deploy-dev:
+    if: github.repository == 'Fishtechy-usa/Overpass-API'
+    needs: build-and-push-image-dev
+    runs-on: self-hosted
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+
+      - name: Resolve deploy variables
+        id: resolve-deploy
+        run: |
+          echo "AWS_REGION=${{ secrets.AWS_REGION }}" | tee -a "$GITHUB_OUTPUT" "$GITHUB_ENV"
+          echo "ECR_REPOSITORY=${{ secrets.ECR_REPOSITORY }}" | tee -a "$GITHUB_OUTPUT" "$GITHUB_ENV"
+          echo "CONTAINER_NAME=${{ secrets.CONTAINER_NAME }}" | tee -a "$GITHUB_OUTPUT" "$GITHUB_ENV"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ steps.resolve-deploy.outputs.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          mask-password: true
+
+      - name: Resolve image from CI commit
+        id: image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Verify image exists in ECR
+        run: |
+          aws ecr describe-images \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-ids imageTag="${{ steps.image.outputs.image_tag }}" \
+            --region "$AWS_REGION" >/dev/null
+
+      - name: Pull image from Amazon ECR
+        run: docker pull "${{ steps.image.outputs.image }}"
+
+      - name: Deploy container on EC2
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
         run: |
           set -euo pipefail
 
@@ -70,9 +133,9 @@ jobs:
             -e OVERPASS_DIFF_UPDATES=0 \
             -v overpass-db:/db \
             -v /opt/overpass-api/data:/data:ro \
-            "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+            "$IMAGE"
 
-      - name: Wait for the API to come up
+      - name: Wait for the API to become healthy
         run: |
           set -euo pipefail
           for i in $(seq 1 30); do
@@ -100,6 +163,65 @@ jobs:
           curl -s -X POST http://localhost/api/interpreter \
             --data-urlencode 'data=[out:json][timeout:60];way["waterway"="river"](29.0,-91.0,31.0,-89.0);out count;'
 
-      - name: Clean up old images
-        if: always()
+      - name: Remove old docker images
         run: docker image prune -f
+
+      - name: Slack Notification on SUCCESS
+        if: success()
+        uses: tokorom/action-slack-incoming-webhook@main
+        env:
+          INCOMING_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        with:
+          text: A develop CD job has succeeded for *overpass-api-dev*.
+          attachments: |
+            [
+              {
+                "color": "good",
+                "author_name": "${{ github.actor }}",
+                "author_icon": "${{ github.event.sender.avatar_url }}",
+                "fields": [
+                  {
+                    "title": "Commit Message",
+                    "value": "${{ github.event.head_commit.message || 'Manual deployment' }}"
+                  },
+                  {
+                    "title": "Run URL",
+                    "value": "${{ format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}"
+                  },
+                  {
+                    "title": "Branch / SHA",
+                    "value": "${{ github.ref_name }} / ${{ steps.image.outputs.image_tag }}"
+                  }
+                ]
+              }
+            ]
+
+      - name: Slack Notification on FAILURE
+        if: failure()
+        uses: tokorom/action-slack-incoming-webhook@main
+        env:
+          INCOMING_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        with:
+          text: A develop CD job has failed for *overpass-api-dev*.
+          attachments: |
+            [
+              {
+                "color": "danger",
+                "author_name": "${{ github.actor }}",
+                "author_icon": "${{ github.event.sender.avatar_url }}",
+                "fields": [
+                  {
+                    "title": "Commit Message",
+                    "value": "${{ github.event.head_commit.message || 'Manual deployment' }}"
+                  },
+                  {
+                    "title": "Run URL",
+                    "value": "${{ format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}"
+                  },
+                  {
+                    "title": "Branch / SHA",
+                    "value": "${{ github.ref_name }} / ${{ steps.image.outputs.image_tag }}"
+                  }
+                ]
+              }
+            ]

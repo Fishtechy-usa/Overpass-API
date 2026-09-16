@@ -1,0 +1,105 @@
+name: Build and deploy Overpass API
+on:
+  push:
+    branches: [ "master" ]
+    paths:
+      - "src/**"
+      - "docker/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch: {}
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+  CONTAINER_NAME: ${{ secrets.CONTAINER_NAME }}
+
+jobs:
+  build-and-deploy:
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate configuration
+        run: |
+          set -euo pipefail
+          for var in AWS_REGION ECR_REGISTRY ECR_REPOSITORY CONTAINER_NAME; do
+            if [ -z "${!var:-}" ]; then
+              echo "ERROR: secret $var is not set."
+              exit 1
+            fi
+          done
+          echo "All required secrets are present."
+
+      - name: Log in to Amazon ECR
+        run: |
+          set -euo pipefail
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+      - name: Build image
+        run: |
+          set -euo pipefail
+          IMAGE_TAG="${GITHUB_SHA::12}"
+          echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
+
+          docker build \
+            -f docker/Dockerfile \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:latest" \
+            .
+
+      - name: Push image to ECR
+        run: |
+          set -euo pipefail
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+
+      - name: Deploy container
+        run: |
+          set -euo pipefail
+
+          # The overpass-db volume is NOT touched — the imported database survives.
+          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+
+          docker run -d --name "$CONTAINER_NAME" \
+            --restart unless-stopped \
+            -p 80:80 \
+            -e OVERPASS_DIFF_UPDATES=0 \
+            -v overpass-db:/db \
+            -v /opt/overpass-api/data:/data:ro \
+            "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+      - name: Wait for the API to come up
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost/api/status >/dev/null 2>&1; then
+              echo "API is responding."
+              curl -s http://localhost/api/status
+              exit 0
+            fi
+            echo "Attempt $i/30 - not ready yet, waiting..."
+            sleep 10
+          done
+
+          echo "API did not respond within 5 minutes. Container logs:"
+          docker logs --tail 50 "$CONTAINER_NAME"
+          exit 1
+
+      - name: Smoke-test the data
+        run: |
+          set -euo pipefail
+          echo "--- Rivers near Kathmandu ---"
+          curl -s -X POST http://localhost/api/interpreter \
+            --data-urlencode 'data=[out:json][timeout:60];way["waterway"="river"](27.65,85.25,27.78,85.40);out count;'
+          echo
+          echo "--- Rivers in the Mississippi delta ---"
+          curl -s -X POST http://localhost/api/interpreter \
+            --data-urlencode 'data=[out:json][timeout:60];way["waterway"="river"](29.0,-91.0,31.0,-89.0);out count;'
+
+      - name: Clean up old images
+        if: always()
+        run: docker image prune -f

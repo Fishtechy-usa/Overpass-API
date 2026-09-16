@@ -53,8 +53,13 @@ else
 fi
 
 # Stale shared-memory / socket files from a previous, uncleanly-stopped run.
+# The dispatcher's unix socket lives at ${DB_DIR}osm3s_osm_base (and
+# osm3s_areas for the area dispatcher). If the container was killed rather
+# than stopped gracefully, these files survive and the next dispatcher fails
+# with "Address already in use". Remove every osm3s* runtime artifact, the
+# same way the upstream debian/overpass init script does.
 rm -f /dev/shm/osm3s* 2>/dev/null || true
-rm -f "${DB_DIR}"osm3s_v* 2>/dev/null || true
+rm -f "${DB_DIR}"osm3s* 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # Start the dispatcher, (optional) diff updater, and Apache
